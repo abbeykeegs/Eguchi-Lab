@@ -26,7 +26,7 @@ library(SummarizedExperiment)
 Next, the salmon output quantification files are loaded in.
 
 ```{r data load}
-dir_All <- "/Users/abiagealkeegan/Desktop/EguchiLab/Data/RNASeq/Analysis_Data"
+dir_All <- "/Users/abiagealkeegan/Desktop/EguchiLab/Data/RNASeq/Analysis_Data" ## raw data used for analysis can be found at 
 files_All <- list.files(dir_All, pattern="quant.sf$", full.names=TRUE)
 samples_All <- sub(".quant.sf", "", basename(files_All))
 names(files_All) <- samples_All
