@@ -6,3 +6,5 @@ Bulk RNA-Sequencing Data Analysis code is attached.
 
 - RNASeq_Analysis_All_Samples.Rmd contains the code used to generate hierarchical clustering and principal component analysis (PCA) plots. 
 - RNASeq_Analysis_CMs_Only.Rmd contains the code to perform differential gene expression and gene ontology (GO) analysis. 
+
+MATLAB Scripts used to complete calcium imaging analysis are located in CalciumAnalysis_resting_ratio. Download the entire folder and use it as a working directory for analysis purposes. 
