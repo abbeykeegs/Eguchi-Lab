@@ -1,4 +1,5 @@
-Microdystrophins Partially Rescue Duchenne Muscular Dystrophy Deficits in iPSC-Cardiomyocytes
+**Microdystrophins Partially Rescue Duchenne Muscular Dystrophy Deficits in iPSC-Cardiomyocytes**
+
 Abiageal R. Keegan, Adriana Fernanda G. S. Gonzalez, Rongruo Zhang, Hung Doan, Sofía I. Torres-Bigio, Fiona Lau, Kaulen N. Ly, Elaine C. Lai, Leahlyn C. Mamuyac, Sriram Bhimaraju, Abhishree Mishra, and Asuka Eguchi
 
 Bulk RNA-Sequencing Data Analysis code is attached
