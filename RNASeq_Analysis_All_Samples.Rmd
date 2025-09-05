@@ -1,0 +1,288 @@
+---
+title: "Salmon Transcripts"
+output: html_document
+date: "2025-06-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+First, libraries needed to complete downstream analysis are loaded.
+
+```{r lib load}
+library(tximport)
+library(readr)
+library(DESeq2)
+library(tidyverse)
+library(tidyr)
+library(rtracklayer)
+library(dplyr)
+library(tibble)
+library(SummarizedExperiment)
+
+```
+
+Next, the salmon output quantification files are loaded in.
+
+```{r data load}
+dir_All <- "/Users/abiagealkeegan/Desktop/EguchiLab/Data/RNASeq/Analysis_Data"
+files_All <- list.files(dir_All, pattern="quant.sf$", full.names=TRUE)
+samples_All <- sub(".quant.sf", "", basename(files_All))
+names(files_All) <- samples_All
+```
+
+The metadata table is now defined.
+
+```{r metadata}
+
+condition <- c(rep("Control", 5), rep("Control.iPSC", 3), rep("DMD.Empty", 4), rep("DMD.iPSC", 3), rep("DMD.microDYS1", 5), rep("DMD.microDYS2", 5),  rep("DMD.microDYS3", 5), rep("DMD.miniDYS", 4))
+
+sampleTable_All <- data.frame(
+  sample = samples_All,
+  condition = condition
+)
+
+rownames(sampleTable_All) <- sampleTable_All$sample
+```
+
+Now, an annotation file is laoded in using the package tximport. This requires a custom function due to the structure of the salmon files and the gencode file for transcripts.
+
+```{r tximport}
+# Read the headers
+fasta_headers <- read_lines("gencode.v44.transcripts.fa.gz") %>%
+  str_subset("^>") %>%
+  str_remove("^>")
+
+#Extract both transcript and gene ID from each line
+tx2gene <- fasta_headers %>%
+  str_extract_all("ENST[0-9]+\\.[0-9]+|ENSG[0-9]+\\.[0-9]+") %>%
+  map(~ tibble(TXNAME = .x[1], GENEID = .x[2])) %>%
+  bind_rows()
+
+#custom function to read in the data
+custom_reader <- function(file) {
+  read_tsv(file, comment = "#", show_col_types = FALSE)
+}
+
+colnames(tx2gene) <- c("TXNAME", "GENEID")
+
+txi_All <- tximport(files_All,
+                    type = "salmon",
+                    txOut = TRUE,
+                    importer = custom_reader,
+                    tx2gene = tx2gene)
+```
+Now, lowly expressed genes are pre-filtered. Code corresponds to an average of 100 counts per sample.
+
+```{r pre-filter}
+txi_All_df <- as.data.frame(txi_All)
+counts_matrix <- txi_All_df[, 35:68]
+
+keep <- rowSums(counts_matrix) >= 3400
+  
+txi_All$abundance <- txi_All$abundance[keep, ]
+txi_All$counts    <- txi_All$counts[keep, ]
+txi_All$length    <- txi_All$length[keep, ]
+
+txi_All_df <- as.data.frame(txi_All)
+counts_matrix_filtered <- txi_All_df[, 35:68]
+```
+
+The Salmon alignment and quantification utilized gencode ids. This code chunk matches the transcript id with the corresponding HGNC gene name according to the gencode anntoation file.  
+
+```{r ENSEMBL to HGNC}
+
+gtf <- import("/Users/abiagealkeegan/Desktop/EguchiLab/Data/RNASeq/gencode.v44.annotation.gtf.gz")
+
+transcripts <- gtf[gtf$type == "transcript"]
+
+tx_annot <- as.data.frame(transcripts)
+
+tx_annot_all <- tx_annot %>%
+  dplyr::select(
+    transcript_id,      
+    gene_id,             
+    gene_name,           
+    transcript_type      
+  ) %>%
+  dplyr::distinct()
+
+```
+
+Now, genes that are protein coding are retained. Genes that are non protein coding are excluded as mRNA selection was conducted.
+
+```{r Protein Coding Filtering}
+
+tx_annot_all <- tx_annot_all %>%
+  filter (transcript_type == "protein_coding")
+
+protein_coding <- tx_annot_all$transcript_id
+protein_coding <- intersect(protein_coding, rownames(txi_All$abundance))
+
+
+txi_All$abundance <- txi_All$abundance[protein_coding, ]
+txi_All$counts    <- txi_All$counts[protein_coding, ]
+txi_All$length    <- txi_All$length[protein_coding, ]
+```
+
+The DESeq2 package is used to complete differentiation gene expression anaylsis. DMD Empty iPSC-CMs were utilized as the reference condition. Contrasts were created to compare DMD Empty iPSC-CMs to every other condition.
+
+```{r DESeq2}
+dds_All <- DESeqDataSetFromTximport(txi_All, colData = sampleTable_All, design = ~ condition)
+dds_All$condition <- relevel(dds_All$condition, ref = "DMD.Empty")
+dds_All <- DESeq(dds_All)
+contrasts_list <- list(
+  c("condition", "Control.iPSC", "DMD.Empty"),
+  c("condition", "Control", "DMD.Empty"),
+  c("condition", "DMD.Empty", "DMD.Empty"), 
+  c("condition", "DMD.iPSC", "DMD.Empty"),
+  c("condition", "DMD.microDYS1", "DMD.Empty"),
+  c("condition", "DMD.microDYS2", "DMD.Empty"),
+  c("condition", "DMD.microDYS3", "DMD.Empty"),
+  c("condition", "DMD.miniDYS", "DMD.Empty"))
+```
+
+The results are extracted from DESeq2. The results are then feed to lfcShrink for Bayesian shrinkage estimators for effect sizes using apeglm. This scales with the  number of genes, the number of samples and the number of conditions defined in the metadata. The annotations from previous steps are then appended to the results. 
+
+```{r Results Loop}
+results_list <- list()
+contrasts_list <- list(
+  c("condition", "Control.iPSC", "DMD.Empty"),
+  c("condition", "Control", "DMD.Empty"),
+  c("condition", "DMD.iPSC", "DMD.Empty"),
+  c("condition", "DMD.microDYS1", "DMD.Empty"),
+  c("condition", "DMD.microDYS2", "DMD.Empty"),
+  c("condition", "DMD.microDYS3", "DMD.Empty"),
+  c("condition", "DMD.miniDYS", "DMD.Empty"))
+
+for (contrast in contrasts_list) {
+  comp_name <- paste(contrast[2], "vs", contrast[3], sep = "_")
+  coef_name <- paste0("condition_", contrast[2], "_vs_", contrast[3])
+  
+  res <- results(dds_All, name=coef_name)
+  
+  res_df <- as.data.frame(res) %>%
+    tibble::rownames_to_column("transcript_id")
+  
+  results_list[[comp_name]] <- res_df
+}
+
+all_results <- dplyr::bind_rows(results_list, .id = "comparison")
+
+head(all_results)
+
+res_annotated <- all_results %>%
+  dplyr::left_join(tx_annot_all, by = "transcript_id")
+
+res_annotated <- res_annotated[, c("gene_name", setdiff(names(res_annotated), "gene_name"))]
+res_annotated <- res_annotated[, c("comparison", setdiff(names(res_annotated), "comparison"))]
+
+res_annotated <- res_annotated %>%
+  dplyr::left_join(tx_annot_all, by = "transcript_id")
+ 
+```
+
+Hierarchical clustering is performed to visualize the similarity of the different samples. This process utilizes the DESeq2 object that underwent variance-stabilizing transformation.
+
+```{r clustering}
+
+vsd <- vst(dds_All, blind = FALSE)
+
+distances_All_filt <- dist(t(assay(vsd)))
+
+sample_labels_All <- colData(dds_All)$condition
+names(sample_labels_All) <- colnames(dds_All)
+
+hc_All_filt <- hclust(distances_All_filt)
+
+plot(hc_All_filt, ylab = "Lance-Williams Distance")
+
+```
+
+Principal component analysis was conducted as another method for visualizing differences among the samples.
+
+```{r PCA}
+
+pcaDataFull <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pcaDataFull, "percentVar"))
+pcaDataFull$condition <- factor(pcaDataFull$condition, levels = c("Control.iPSC", "DMD.iPSC", "Control", "DMD.Empty", "DMD.microDYS1", "DMD.microDYS2", "DMD.microDYS3", "DMD.miniDYS"))
+
+pcaDataFull$SampleName <- colnames(vsd)
+
+ggplot(pcaDataFull, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 1) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ylim(c(min(pcaDataFull$PC2) - 1, max(pcaDataFull$PC2) + 1)) +
+  labs(color = "Condition") +
+  coord_fixed() +  
+  theme_minimal() +
+  theme(aspect.ratio = 1)  
+
+
+```
+
+Principal component analysis was conducted again using only the cardiomyocyte samples. 
+
+```{r PCA CM}
+
+vsd_CM <- vsd[, vsd$condition %in% c("DMD.Empty", "DMD.miniDYS", "Control", "DMD.microDYS2", "DMD.microDYS3","DMD.microDYS1")]
+
+pcaDataCM <- plotPCA(vsd_CM, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pcaDataCM, "percentVar"))
+pcaDataCM$condition <- factor(pcaDataCM$condition, levels = c("Control", "DMD.Empty", "DMD.microDYS1", "DMD.microDYS2", "DMD.microDYS3", "DMD.miniDYS"))
+
+pcaDataCM$SampleName <- colnames(vsd_CM)
+
+ggplot(pcaDataCM, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 1) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ylim(c(min(pcaDataCM$PC2) - 1, max(pcaDataCM$PC2) + 1)) +
+  labs(color = "Condition") +
+  coord_fixed() +  
+  theme_minimal() +
+  theme(aspect.ratio = 1)
+
+```
+
+Biological replicates were averaged and Principal Component Analysis was performed again. 
+
+```{r PCA CM}
+
+vsd_CM <- vsd[, vsd$condition %in% c("DMD.Empty", "DMD.miniDYS", "Control", "DMD.microDYS2", "DMD.microDYS3","DMD.microDYS1")]
+
+assay_vsd_CM <- assay(vsd_CM)
+conds_CM <- colData(vsd_CM)$condition
+conds_CM <- droplevels(conds_CM)
+
+averaged_matrix_CM <- sapply(levels(conds_CM), function(cn) {
+  rowMeans(assay_vsd_CM[, conds_CM == cn, drop = FALSE])
+})
+
+rownames(averaged_matrix_CM) <- rownames(assay_vsd_CM)
+
+pca_CM <- prcomp(t(averaged_matrix_CM), scale. = TRUE)
+
+percentVar <- round(100 * (pca_CM$sdev^2 / sum(pca_CM$sdev^2)), 1)
+
+pcaDataCM <- data.frame(
+  PC1 = pca_CM$x[,1],
+  PC2 = pca_CM$x[,2],
+  condition = colnames(averaged_matrix_CM)
+)
+
+ggplot(pcaDataCM, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ylim(c(min(pcaDataCM$PC2) - 1, max(pcaDataCM$PC2) + 1)) +
+  labs(color = "Condition") +
+  coord_fixed() +  
+  theme_minimal() +
+  theme(aspect.ratio = 1)
+
+```
+
+

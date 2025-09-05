@@ -1,0 +1,923 @@
+---
+title: "RNASeq_justCM"
+output: html_document
+date: "2025-07-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+First, libraries needed to complete downstream analysis are loaded.
+
+```{r lib load}
+library(tximport)
+library(readr)
+library(DESeq2)
+library(tidyverse)
+library(tidyr)
+library(rtracklayer)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(pcaExplorer)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+Next, the salmon output quantification files are loaded in.
+
+```{r data load}
+dir_All <- "/Users/abiagealkeegan/Desktop/EguchiLab/Data/RNASeq/Analysis_Data_CM"
+files_All <- list.files(dir_All, pattern="quant.sf$", full.names=TRUE)
+samples_All <- sub(".quant.sf", "", basename(files_All))
+names(files_All) <- samples_All
+```
+
+The metadata table is now defined.
+
+```{r metadata}
+
+condition <- c(rep("Control.Empty", 5), rep("DMD.Empty", 4), rep("DMD.microDYS1", 5), rep("DMD.microDYS2", 5),  rep("DMD.microDYS3", 5), rep("DMD.miniDYS", 4))
+
+sampleTable_All <- data.frame(
+  sample = samples_All,
+  condition = condition
+)
+
+rownames(sampleTable_All) <- sampleTable_All$sample
+```
+
+Now, an annotation file is laoded in using the package tximport. This requires a custom function due to the structure of the salmon files and the gencode file for transcripts.
+
+```{r tximport}
+
+# Loads the headers of the gencode annotation file
+fasta_headers <- read_lines("gencode.v44.transcripts.fa.gz") %>%
+  str_subset("^>") %>%
+  str_remove("^>")
+
+#Extract both transcript and gene ID from each line
+tx2gene <- fasta_headers %>%
+  str_extract_all("ENST[0-9]+\\.[0-9]+|ENSG[0-9]+\\.[0-9]+") %>%
+  map(~ tibble(TXNAME = .x[1], GENEID = .x[2])) %>%
+  bind_rows()
+
+#custom function to read in the data
+custom_reader <- function(file) {
+  read_tsv(file, comment = "#", show_col_types = FALSE)
+}
+
+# updates table with transcript names and gene names
+colnames(tx2gene) <- c("TXNAME", "GENEID")
+
+# creates large list with raw counts, abundance, gene length, and corresponding gene annotations
+txi_All <- tximport(files_All,
+                    type = "salmon",
+                    txOut = TRUE,
+                    importer = custom_reader,
+                    tx2gene = tx2gene)
+```
+
+Now, lowly expressed genes are pre-filtered. Code corresponds to an average of 100 counts per sample.
+
+```{r pre-filter lowly expressed genes}
+
+txi_All_df <- as.data.frame(txi_All)
+counts_matrix <- txi_All_df[, 29:56] # corresponds to the raw counts
+
+keep <- rowSums(counts_matrix) >= 2800 
+  
+txi_All$abundance <- txi_All$abundance[keep, ]
+txi_All$counts    <- txi_All$counts[keep, ]
+txi_All$length    <- txi_All$length[keep, ]
+
+txi_All_df <- as.data.frame(txi_All)
+counts_matrix_filtered <- txi_All_df[, 29:56]
+
+```
+
+The Salmon alignment and quantification utilized gencode ids. This code chunk matches the transcript id with the corresponding HGNC gene name according to the gencode anntoation file. 
+
+```{r ENSEMBL to HGNC}
+
+gtf <- import("/Users/abiagealkeegan/Desktop/EguchiLab/Data/RNASeq/gencode.v44.annotation.gtf.gz")
+
+transcripts <- gtf[gtf$type == "transcript"]
+
+tx_annot <- as.data.frame(transcripts)
+
+tx_annot_all <- tx_annot %>%
+  dplyr::select(
+    transcript_id,      
+    gene_id,             
+    gene_name,           
+    transcript_type      
+  ) %>%
+  dplyr::distinct()
+```
+
+Now, genes that are protein coding are retained. Genes that are non protein coding are excluded as mRNA selection was conducted.
+
+```{r Protein Coding Filtering}
+tx_annot_all <- tx_annot_all %>%
+  filter (transcript_type == "protein_coding")
+
+protein_coding <- tx_annot_all$transcript_id
+protein_coding <- intersect(protein_coding, rownames(txi_All$abundance))
+
+
+txi_All$abundance <- txi_All$abundance[protein_coding, ]
+txi_All$counts    <- txi_All$counts[protein_coding, ]
+txi_All$length    <- txi_All$length[protein_coding, ]
+txi_All_df <- as.data.frame(txi_All)
+```
+
+The DESeq2 package is used to complete differentiation gene expression anaylsis. DMD Empty iPSC-CMs were utilized as the reference condition. Contrasts were created to compare DMD Empty iPSC-CMs to every other condition. 
+
+```{r DESeq2}
+dds_All <- DESeqDataSetFromTximport(txi_All, colData = sampleTable_All, design = ~ condition)
+dds_All$condition <- relevel(dds_All$condition, ref = "DMD.Empty")
+dds_All <- DESeq(dds_All)
+contrasts_list <- list(
+  c("condition", "Control.Empty", "DMD.Empty"),
+  c("condition", "DMD.Empty", "DMD.Empty"), 
+  c("condition", "DMD.microDYS1", "DMD.Empty"),
+  c("condition", "DMD.microDYS2", "DMD.Empty"),
+  c("condition", "DMD.microDYS3", "DMD.Empty"),
+  c("condition", "DMD.miniDYS", "DMD.Empty"))
+```
+
+The results are extracted from DESeq2. The results are then feed to lfcShrink for Bayesian shrinkage estimators for effect sizes using apeglm. This scales with the  number of genes, the number of samples and the number of conditions defined in the metadata. The annotations from previous steps are then appended to the results. 
+
+```{r Results Loop}
+results_list <- list()
+contrasts_list <- list(
+  c("condition", "Control.Empty", "DMD.Empty"),
+  c("condition", "DMD.microDYS1", "DMD.Empty"),
+  c("condition", "DMD.microDYS2", "DMD.Empty"),
+  c("condition", "DMD.microDYS3", "DMD.Empty"),
+  c("condition", "DMD.miniDYS", "DMD.Empty"))
+
+for (contrast in contrasts_list) {
+  comp_name <- paste(contrast[2], "vs", contrast[3], sep = "_")
+  coef_name <- paste0("condition_", contrast[2], "_vs_", contrast[3])
+  
+  res <- lfcShrink(dds_All,
+                   coef = coef_name,
+                   type = "apeglm",
+                   lfcThreshold = 1)
+  
+  res_df <- as.data.frame(res) %>%
+    tibble::rownames_to_column("transcript_id")
+  
+  results_list[[comp_name]] <- res_df
+}
+
+all_results <- dplyr::bind_rows(results_list, .id = "comparison")
+
+head(all_results)
+
+res_annotated <- all_results %>%
+  dplyr::left_join(tx_annot_all, by = "transcript_id")
+
+res_annotated <- res_annotated[, c("gene_name", setdiff(names(res_annotated), "gene_name"))]
+res_annotated <- res_annotated[, c("comparison", setdiff(names(res_annotated), "comparison"))]
+
+res_annotated <- res_annotated %>%
+  dplyr::left_join(tx_annot_all, by = "transcript_id")
+ 
+```
+
+Specific comparisons are then extracted from the results. DEGs are defined as genes with a log2 fold change greater than |1| with an adjusted p-value < 0.05. The adjusted p-value uses the Benjamini-Hochberg procedure, to control the false discovery rate.
+
+```{r DMD vs Control Empty}
+
+res_empty <- results(dds_All, contrast = c("condition", "Control.Empty", "DMD.Empty")) %>%
+  as.data.frame() 
+
+res_empty<- res_empty %>%
+  rownames_to_column("transcript_id") %>%
+  left_join(tx_annot_all, by = "transcript_id") %>%
+  mutate(
+    label = ifelse(!is.na(gene_name), gene_name, transcript_id),
+    sig = case_when(
+      padj < 0.05 & log2FoldChange > 1 ~ "Up",
+      padj < 0.05 & log2FoldChange < -1 ~ "Down",
+      TRUE ~ "Not Sig"
+    )
+  )
+
+res_empty$Condition <- "Control.Empty"
+
+DEGs_DMD_Control <- res_empty %>%
+  filter (sig != "Not Sig") 
+
+```
+
+```{r DMD Empty vs DMD microDYS1}
+
+res_microDYS1 <- results(dds_All, contrast = c("condition", "DMD.Empty", "DMD.microDYS1")) %>%
+  as.data.frame() 
+
+
+res_microDYS1 <- res_microDYS1 %>%
+  rownames_to_column("transcript_id") %>%
+  left_join(tx_annot_all, by = "transcript_id") %>%
+  mutate(
+    label = ifelse(!is.na(gene_name), gene_name, transcript_id),
+    sig = case_when(
+      padj < 0.05 & log2FoldChange > 1 ~ "Up",
+      padj < 0.05 & log2FoldChange < -1 ~ "Down",
+      TRUE ~ "Not Sig"
+    )
+  )
+
+res_microDYS1$Condition <- "microDYS1"
+
+DEGs_DMD_microDYS1 <- res_microDYS1 %>%
+  filter (sig != "Not Sig") 
+
+```
+
+```{r DMD Empty vs DMD microDYS2}
+
+res_microDYS2 <- results(dds_All, contrast = c("condition", "DMD.Empty", "DMD.microDYS2")) %>%
+  as.data.frame() 
+
+res_microDYS2 <- res_microDYS2 %>%
+  rownames_to_column("transcript_id") %>%
+  left_join(tx_annot_all, by = "transcript_id") %>%
+  mutate(
+    label = ifelse(!is.na(gene_name), gene_name, transcript_id),
+    sig = case_when(
+      padj < 0.05 & log2FoldChange > 1 ~ "Up",
+      padj < 0.05 & log2FoldChange < -1 ~ "Down",
+      TRUE ~ "Not Sig"
+    )
+  )
+
+res_microDYS2$Condition <- "microDYS2"
+
+DEGs_DMD_microDYS2 <- res_microDYS2 %>%
+  filter (sig != "Not Sig") 
+
+```
+
+```{r DMD Empty vs DMD microDYS3}
+
+res_microDYS3 <- results(dds_All, contrast = c("condition", "DMD.Empty", "DMD.microDYS3")) %>%
+  as.data.frame() 
+  
+
+res_microDYS3 <- res_microDYS3 %>%
+  rownames_to_column("transcript_id") %>%
+  left_join(tx_annot_all, by = "transcript_id") %>%
+  mutate(
+    label = ifelse(!is.na(gene_name), gene_name, transcript_id),
+    sig = case_when(
+      padj < 0.05 & log2FoldChange > 1 ~ "Up",
+      padj < 0.05 & log2FoldChange < -1 ~ "Down",
+      TRUE ~ "Not Sig"
+    )
+  )
+
+res_microDYS3$Condition <- "microDYS3"
+
+DEGs_DMD_microDYS3 <- res_microDYS3 %>%
+  filter (sig != "Not Sig") 
+```
+
+```{r DMD Empty vs DMD miniDYS}
+
+res_miniDYS <- results(dds_All, contrast = c("condition", "DMD.Empty", "DMD.miniDYS")) %>%
+  as.data.frame() 
+  
+
+res_miniDYS <- res_miniDYS %>%
+  rownames_to_column("transcript_id") %>%
+  left_join(tx_annot_all, by = "transcript_id") %>%
+  mutate(
+    label = ifelse(!is.na(gene_name), gene_name, transcript_id),
+    sig = case_when(
+      padj < 0.05 & log2FoldChange > 1 ~ "Up",
+      padj < 0.05 & log2FoldChange < -1 ~ "Down",
+      TRUE ~ "Not Sig"
+    )
+  )
+
+res_miniDYS$Condition <- "miniDYS"
+
+DEGs_DMD_miniDYS <- res_miniDYS %>%
+  filter (sig != "Not Sig") 
+```
+
+The data then undergo variance-stabilizing transformation. All the DEGs from each condition are combined into a single data frame where the input is normalized counts. The transcript ids are then cleaned for downstream analysis.
+
+```{r heatmap DEGS}
+
+vsd <- vst(dds_All, blind = FALSE)
+
+DEGs_All <- rbind(DEGs_DMD_Control, DEGs_DMD_microDYS1, DEGs_DMD_microDYS2, DEGs_DMD_microDYS3, DEGs_DMD_miniDYS)
+
+sig_transcript_ids_All <- unique(DEGs_All$transcript_id)
+DEG_matrix_All <- assay(vsd)[sig_transcript_ids_All, ]
+DEG_table_All <- DEG_matrix_All %>%
+  as.data.frame() 
+DEG_table_All$transcript_id <- rownames(DEG_table_All)
+
+tx_annot_all$transcript_id_clean <- sub("\\..*", "", tx_annot_all$transcript_id)
+
+DEG_table_All$transcript_id_clean <- sub("\\..*", "", DEG_table_All$transcript_id)
+
+transcript_to_gene <- setNames(tx_annot_all$gene_name, tx_annot_all$transcript_id_clean)
+
+hgnc_list <- transcript_to_gene[DEG_table_All$transcript_id_clean]
+DEG_table_All$gene_name <- hgnc_list
+
+```
+
+A heatmap of all the DEGs are created by combining the results from each comparisons and creating a table of the DEGs and corresponding results. This data is scaled for visualization purposes. Hierarchical clustering is computed for the genes to separate into three clusters.
+
+```{r Clustered Heatmap}
+
+res_CM <- rbind(res_empty, res_microDYS1, res_microDYS2, res_microDYS3, res_miniDYS)
+
+rownames(DEG_table_All) <- make.unique(DEG_table_All$gene_name)
+
+DEG_table_All$transcript_id <- NULL
+DEG_table_All$gene_name <- NULL
+
+order <- c("Control_1", "Control_2", "Control_3", "Control_4", "Control_5", "DMD_Empty_1", "DMD_Empty_2", "DMD_Empty_3", "DMD_Empty_4", "DMD_microDYS1_1", "DMD_microDYS1_2", "DMD_microDYS1_3","DMD_microDYS1_4", "DMD_microDYS1_5","DMD_microDYS2_1","DMD_microDYS2_2", "DMD_microDYS2_3", "DMD_microDYS2_4", "DMD_microDYS2_5", "DMD_microDYS3_1", "DMD_microDYS3_2", "DMD_microDYS3_3", "DMD_microDYS3_4", "DMD_microDYS3_5", "DMD_miniDYS_1","DMD_miniDYS_2", "DMD_miniDYS_3", "DMD_miniDYS_4")
+
+DEG_table_All <- DEG_table_All[, order]
+
+scaled_DEG_table <- t(scale(t(DEG_table_All)))
+
+Heatmap(scaled_DEG_table,
+              name = "Z-score",
+              cluster_rows = TRUE,
+              cluster_columns = FALSE,
+              row_names_gp = grid::gpar(fontsize = 3),
+              column_names_gp = grid::gpar(fontsize = 5),
+              clustering_distance_rows = "euclidean",
+              clustering_distance_columns = "euclidean",
+              col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")))
+
+
+
+```
+
+Averaged heatmap collapses the biological replicates. 
+
+```{r Averaged Clustered Heatmap}
+
+scaled_DEG_Control <- scaled_DEG_table[, 1:5] %>%
+  rowMeans() %>%
+  as.data.frame()
+
+colnames(scaled_DEG_Control)[1] <- "Control"
+
+scaled_DEG_DMD <- scaled_DEG_table[, 6:9]%>%
+  rowMeans() %>%
+  as.data.frame()
+
+colnames(scaled_DEG_DMD)[1] <- "DMD"
+
+scaled_DEG_microDYS1 <- scaled_DEG_table[, 10:14]%>%
+  rowMeans() %>%
+  as.data.frame()
+
+colnames(scaled_DEG_microDYS1)[1] <- "microDYS1"
+
+scaled_DEG_microDYS2 <- scaled_DEG_table[, 15:19]%>%
+  rowMeans() %>%
+  as.data.frame()
+
+colnames(scaled_DEG_microDYS2)[1] <- "microDYS2"
+
+scaled_DEG_microDYS3 <- scaled_DEG_table[, 20:24]%>%
+  rowMeans() %>%
+  as.data.frame()
+
+colnames(scaled_DEG_microDYS3)[1] <- "microDYS3"
+
+scaled_DEG_miniDYS <- scaled_DEG_table[, 25:28]%>%
+  rowMeans() %>%
+  as.data.frame()
+
+colnames(scaled_DEG_miniDYS)[1] <- "miniDYS"
+
+averaged_scaled_DEG_table <- cbind(scaled_DEG_Control, scaled_DEG_DMD, scaled_DEG_microDYS1, scaled_DEG_microDYS2, scaled_DEG_microDYS3, scaled_DEG_miniDYS)
+
+heatmap_data <- Heatmap(averaged_scaled_DEG_table,
+              name = "Z-score",
+              cluster_rows = TRUE,
+              cluster_columns = FALSE,
+              row_names_gp = grid::gpar(fontsize = 3),
+              column_names_gp = grid::gpar(fontsize = 5),
+              clustering_distance_rows = "euclidean",
+              clustering_distance_columns = "euclidean",
+              col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")))
+
+heatmap_draft <- draw(heatmap_data)
+
+row_dendrogram_DEGs <- row_dend(heatmap_draft)
+
+k <- 3
+clusters_DEGs <- cutree(as.hclust(row_dendrogram_DEGs), k = k)
+
+gene_clusters_DEGs <- split(names(clusters_DEGs), clusters_DEGs)
+for (i in seq_along(gene_clusters_DEGs)) {
+  cat(paste0("Cluster ", i, ":\n"))
+  print(gene_clusters_DEGs[[i]])
+  cat("\n") }
+
+row_dendrogram_DEGs <- hclust(dist(scaled_DEG_table))
+k <- 3  
+row_clusters_DEGs <- cutree(row_dendrogram_DEGs, k = k)
+
+Heatmap(averaged_scaled_DEG_table,
+        name = "Z-score",
+        cluster_rows = TRUE,
+        cluster_columns = FALSE,
+        row_split = factor(row_clusters_DEGs, levels = 1:k), 
+        row_names_gp = grid::gpar(fontsize = 3),
+        column_names_gp = grid::gpar(fontsize = 10),
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")))
+
+```
+
+Next, Gene Ontology Analysis for each of the clusters was performed. HGNC IDs were matched with ENTREZ IDs for the purpose of the clusterprofiler package requirements.
+
+```{r GO Cluster 1}
+
+hgnc_genes_cluster_1 <- gene_clusters_DEGs[["1"]]
+
+gene_cluster1_df <- bitr(hgnc_genes_cluster_1,
+                fromType = "SYMBOL",
+                toType = "ENTREZID",
+                OrgDb = org.Hs.eg.db)
+
+
+ego_cluster1 <- enrichGO(gene = gene_cluster1_df$ENTREZID,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "All", 
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                readable = TRUE)
+      
+ego_cluster1_df <- as.data.frame(ego_cluster1)
+
+```
+
+GO results were plotted using ggplot2. The top 10 GO terms based on count were included. 
+
+```{r plot ego cluster1}
+
+top_terms_ego_cluster1 <- ego_cluster1_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+top_terms_ego_cluster1$Description <- factor(top_terms_ego_cluster1$Description, levels = rev(top_terms_ego_cluster1$Description))
+
+ggplot(top_terms_ego_cluster1, aes(x = Description, y = Count, fill = p.adjust)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "indianred", high = "dodgerblue3", name = "Adjusted\np-value"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title = element_blank(),
+    aspect.ratio = 1,  # Square plotting area
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),  # Outline
+    panel.grid.major = element_line(color = "grey80"),  # Keep gridlines
+    panel.grid.minor = element_line(color = "grey90")
+  ) +
+  labs(fill = "Adj. p-value")
+
+```
+
+```{r GO Cluster 2}
+
+hgnc_genes_cluster_2 <- gene_clusters_DEGs[["2"]]
+
+gene_cluster2_df <- bitr(hgnc_genes_cluster_2,
+                fromType = "SYMBOL",
+                toType = "ENTREZID",
+                OrgDb = org.Hs.eg.db)
+
+
+ego_cluster2 <- enrichGO(gene = gene_cluster2_df$ENTREZID,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "All", 
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                readable = TRUE)
+      
+ego_cluster2_df <- as.data.frame(ego_cluster2)
+
+barplot(ego_cluster2, showCategory = 10, orderBy = "Count") 
+
+```
+
+```{r plot ego cluster2}
+
+top_terms_ego_cluster2 <- ego_cluster2_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+top_terms_ego_cluster2$Description <- factor(top_terms_ego_cluster2$Description, levels = rev(top_terms_ego_cluster2$Description))
+
+ggplot(top_terms_ego_cluster2, aes(x = Description, y = Count, fill = p.adjust)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "indianred", high = "dodgerblue3", name = "Adjusted\np-value"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title = element_blank(),
+    aspect.ratio = 1,  # Square plotting area
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),  # Outline
+    panel.grid.major = element_line(color = "grey80"),  # Keep gridlines
+    panel.grid.minor = element_line(color = "grey90")
+  ) +
+  labs(fill = "Adj. p-value")
+
+```
+
+```{r GO Cluster 3}
+
+hgnc_genes_cluster_3 <- gene_clusters_DEGs[["3"]]
+
+gene_cluster3_df <- bitr(hgnc_genes_cluster_3,
+                fromType = "SYMBOL",
+                toType = "ENTREZID",
+                OrgDb = org.Hs.eg.db)
+
+
+ego_cluster3 <- enrichGO(gene = gene_cluster3_df$ENTREZID,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "All", 
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                readable = TRUE)
+      
+ego_cluster3_df <- as.data.frame(ego_cluster3)
+
+```
+
+```{r plot ego cluster3}
+
+top_terms_ego_cluster3 <- ego_cluster3_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+top_terms_ego_cluster3$Description <- factor(top_terms_ego_cluster3$Description, levels = rev(top_terms_ego_cluster3$Description))
+
+ggplot(top_terms_ego_cluster3, aes(x = Description, y = Count, fill = p.adjust)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "indianred", high = "dodgerblue3", name = "Adjusted\np-value"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title = element_blank(),
+    aspect.ratio = 1,  # Square plotting area
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),  
+    panel.grid.major = element_line(color = "grey80"), 
+    panel.grid.minor = element_line(color = "grey90")
+  ) +
+  labs(fill = "Adj. p-value")
+```
+
+GO analysis was performed in the same manner for each set of DEGs for each comparison. 
+
+```{r GO Analysis DMD vs Control}
+
+sig_gene_ids_DMD_Control <- DEGs_DMD_Control$gene_id
+
+
+clean_gene_ids_DMD_Control <- sub("\\..*$", "", DEGs_DMD_Control$gene_id)
+
+gene_map_DMD_Control <- mapIds(org.Hs.eg.db,
+                   keys = clean_gene_ids_DMD_Control,
+                   column = "ENTREZID",
+                   keytype = "ENSEMBL",
+                   multiVals = "first")
+
+entrez_ids_DMD_Control <- na.omit(gene_map_DMD_Control)
+
+ego_DMD_Control <- enrichGO(gene = entrez_ids_DMD_Control,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "All",               
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                readable = TRUE)         
+
+
+ego_DMD_Control_df <- as.data.frame(ego_DMD_Control)
+
+barplot(ego_DMD_Control, showCategory = 15, orderBy = "Count") 
+```
+
+```{r plot ego DMD vs Control}
+
+top_terms_ego_DMD_Control <- ego_DMD_Control_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+top_terms_ego_DMD_Control$Description <- factor(top_terms_ego_DMD_Control$Description, levels = rev(top_terms_ego_DMD_Control$Description))
+
+ggplot(top_terms_ego_DMD_Control, aes(x = Description, y = Count, fill = p.adjust)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "indianred", high = "dodgerblue3", name = "Adjusted\np-value"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title = element_blank(),
+    aspect.ratio = 1,  # Square plotting area
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),  
+    panel.grid.major = element_line(color = "grey80"), 
+    panel.grid.minor = element_line(color = "grey90")
+  ) +
+  labs(fill = "Adj. p-value")
+```
+
+```{r GO Analysis DMD vs microDYS1}
+
+sig_gene_ids_DMD_microDYS1 <- DEGs_DMD_microDYS1$gene_id
+
+
+clean_gene_ids_DMD_microDYS1 <- sub("\\..*$", "", DEGs_DMD_microDYS1$gene_id)
+
+gene_map_DMD_microDYS1 <- mapIds(org.Hs.eg.db,
+                   keys = clean_gene_ids_DMD_microDYS1,
+                   column = "ENTREZID",
+                   keytype = "ENSEMBL",
+                   multiVals = "first")
+
+entrez_ids_DMD_microDYS1 <- na.omit(gene_map_DMD_microDYS1)
+
+ego_DMD_microDYS1 <- enrichGO(gene = entrez_ids_DMD_microDYS1,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "All",               
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                readable = TRUE)         
+
+
+ego_DMD_microDYS1_df <- as.data.frame(ego_DMD_microDYS1)
+
+barplot(ego_DMD_microDYS1, showCategory = 15, orderBy = "Count") 
+```
+
+```{r plot ego DMD vs microDYS1}
+
+top_terms_ego_DMD_microDYS1 <- ego_DMD_microDYS1_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+top_terms_ego_DMD_microDYS1$Description <- factor(top_terms_ego_DMD_microDYS1$Description, levels = rev(top_terms_ego_DMD_microDYS1$Description))
+
+ggplot(top_terms_ego_DMD_microDYS1, aes(x = Description, y = Count, fill = p.adjust)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "indianred", high = "dodgerblue3", name = "Adjusted\np-value"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title = element_blank(),
+    aspect.ratio = 1,  # Square plotting area
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),  
+    panel.grid.major = element_line(color = "grey80"), 
+    panel.grid.minor = element_line(color = "grey90")
+  ) +
+  labs(fill = "Adj. p-value")
+```
+
+```{r GO Analysis DMD vs microDYS2}
+
+sig_gene_ids_DMD_microDYS2 <- DEGs_DMD_microDYS2$gene_id
+
+
+clean_gene_ids_DMD_microDYS2 <- sub("\\..*$", "", DEGs_DMD_microDYS2$gene_id)
+
+gene_map_DMD_microDYS2 <- mapIds(org.Hs.eg.db,
+                   keys = clean_gene_ids_DMD_microDYS2,
+                   column = "ENTREZID",
+                   keytype = "ENSEMBL",
+                   multiVals = "first")
+
+entrez_ids_DMD_microDYS2 <- na.omit(gene_map_DMD_microDYS2)
+
+ego_DMD_microDYS2 <- enrichGO(gene = entrez_ids_DMD_microDYS2,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "All",               
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                readable = TRUE)         
+
+
+ego_DMD_microDYS2_df <- as.data.frame(ego_DMD_microDYS2)
+
+barplot(ego_DMD_microDYS2, showCategory = 15, orderBy = "Count") 
+```
+
+```{r plot ego DMD vs microDYS2}
+
+top_terms_ego_DMD_microDYS2 <- ego_DMD_microDYS2_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+top_terms_ego_DMD_microDYS2$Description <- factor(top_terms_ego_DMD_microDYS2$Description, levels = rev(top_terms_ego_DMD_microDYS2$Description))
+
+ggplot(top_terms_ego_DMD_microDYS2, aes(x = Description, y = Count, fill = p.adjust)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "indianred", high = "dodgerblue3", name = "Adjusted\np-value"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title = element_blank(),
+    aspect.ratio = 1,  # Square plotting area
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),  
+    panel.grid.major = element_line(color = "grey80"), 
+    panel.grid.minor = element_line(color = "grey90")
+  ) +
+  labs(fill = "Adj. p-value")
+```
+
+```{r GO Analysis DMD vs microDYS3}
+
+sig_gene_ids_DMD_microDYS3 <- DEGs_DMD_microDYS3$gene_id
+
+
+clean_gene_ids_DMD_microDYS3 <- sub("\\..*$", "", DEGs_DMD_microDYS3$gene_id)
+
+gene_map_DMD_microDYS3 <- mapIds(org.Hs.eg.db,
+                   keys = clean_gene_ids_DMD_microDYS3,
+                   column = "ENTREZID",
+                   keytype = "ENSEMBL",
+                   multiVals = "first")
+
+entrez_ids_DMD_microDYS3 <- na.omit(gene_map_DMD_microDYS3)
+
+ego_DMD_microDYS3 <- enrichGO(gene = entrez_ids_DMD_microDYS3,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "All",               
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                readable = TRUE)         
+
+
+ego_DMD_microDYS3_df <- as.data.frame(ego_DMD_microDYS3)
+
+barplot(ego_DMD_microDYS3, showCategory = 15, orderBy = "Count") 
+```
+
+```{r plot ego DMD vs microDYS3}
+
+top_terms_ego_DMD_microDYS3 <- ego_DMD_microDYS3_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+top_terms_ego_DMD_microDYS3$Description <- factor(top_terms_ego_DMD_microDYS3$Description, levels = rev(top_terms_ego_DMD_microDYS3$Description))
+
+ggplot(top_terms_ego_DMD_microDYS3, aes(x = Description, y = Count, fill = p.adjust)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "indianred", high = "dodgerblue3", name = "Adjusted\np-value"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title = element_blank(),
+    aspect.ratio = 1,  # Square plotting area
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),  
+    panel.grid.major = element_line(color = "grey80"), 
+    panel.grid.minor = element_line(color = "grey90")
+  ) +
+  labs(fill = "Adj. p-value")
+```
+
+```{r GO Analysis DMD vs miniDYS}
+
+sig_gene_ids_DMD_miniDYS <- DEGs_DMD_miniDYS$gene_id
+
+
+clean_gene_ids_DMD_miniDYS <- sub("\\..*$", "", DEGs_DMD_miniDYS$gene_id)
+
+gene_map_DMD_miniDYS <- mapIds(org.Hs.eg.db,
+                   keys = clean_gene_ids_DMD_miniDYS,
+                   column = "ENTREZID",
+                   keytype = "ENSEMBL",
+                   multiVals = "first")
+
+entrez_ids_DMD_miniDYS <- na.omit(gene_map_DMD_miniDYS)
+
+ego_DMD_miniDYS <- enrichGO(gene = entrez_ids_DMD_miniDYS,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "All",               
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                readable = TRUE)         
+
+
+ego_DMD_miniDYS_df <- as.data.frame(ego_DMD_miniDYS)
+
+barplot(ego_DMD_miniDYS, showCategory = 15, orderBy = "Count") 
+```
+
+```{r plot ego DMD vs miniDYS}
+
+top_terms_ego_DMD_miniDYS <- ego_DMD_miniDYS_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+top_terms_ego_DMD_miniDYS$Description <- factor(top_terms_ego_DMD_miniDYS$Description, levels = rev(top_terms_ego_DMD_miniDYS$Description))
+
+ggplot(top_terms_ego_DMD_miniDYS, aes(x = Description, y = Count, fill = p.adjust)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "indianred", high = "dodgerblue3", name = "Adjusted\np-value"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title = element_blank(),
+    aspect.ratio = 1,  # Square plotting area
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),  
+    panel.grid.major = element_line(color = "grey80"), 
+    panel.grid.minor = element_line(color = "grey90")
+  ) +
+  labs(fill = "Adj. p-value")
+```
+
+```{r Cardiac Differentiation}
+
+cardiac_differentiation <- c("NPPB", "BMP10", "HEG1", "HOPX", "SORBS2", "MSX2", "NKX2-6", "PLEC", "TSC1", "NOTCH1", "ANKRD1", "TENM4", "MYL2", "MYH6", "MYH7", "TPM1", "MEF2A", "RARA", "PRKAR1A", "FHOD3")
+
+cardiac_differentiation_table <- scaled_DEG_table[rownames(scaled_DEG_table) %in% cardiac_differentiation, ]
+
+Heatmap(cardiac_differentiation_table,
+        name = "Z-score",
+        cluster_rows = TRUE,
+        cluster_columns = FALSE,
+        row_names_gp = grid::gpar(fontsize = 8),
+        column_names_gp = grid::gpar(fontsize = 10),
+        clustering_distance_rows = "euclidean",
+        col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")))
+```
+
+```{r Cardiac Differentiation Avg}
+
+cardiac_differentiation <- c("NPPB", "BMP10", "HEG1", "HOPX", "SORBS2", "MSX2", "NKX2-6", "PLEC", "TSC1", "NOTCH1", "ANKRD1", "TENM4", "MYL2", "MYH6", "MYH7", "TPM1", "MEF2A", "RARA", "PRKAR1A", "FHOD3")
+
+cardiac_differentiation_table_avg <- averaged_scaled_DEG_table[rownames(averaged_scaled_DEG_table) %in% cardiac_differentiation, ]
+
+Heatmap(cardiac_differentiation_table_avg,
+        name = "Z-score",
+        cluster_rows = TRUE,
+        cluster_columns = FALSE,
+        row_names_gp = grid::gpar(fontsize = 8),
+        column_names_gp = grid::gpar(fontsize = 10),
+        clustering_distance_rows = "euclidean",
+        col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")))
+```
